@@ -1,4 +1,4 @@
-# 😺 Agentless
+# 😺 BlurAi-Agentless: updated with agent reviewer 8.23
 
 <p align="center">
     <a href="https://arxiv.org/abs/2407.01489"><img src="https://img.shields.io/badge/📃-Arxiv-b31b1b?style=for-the-badge"></a>
