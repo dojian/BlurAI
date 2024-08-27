@@ -213,6 +213,12 @@ def construct_topn_file_context(
     topn_content = ""
 
     for pred_file, locs in file_to_locs.items():
+        # Check if the file is in the retrieved contents
+        if pred_file not in file_contents:
+            # Log a warning and continue with the next file
+            print(f"Warning: {pred_file} not found in file_contents, skipping.")
+            continue
+
         content = file_contents[pred_file]
         line_locs, context_intervals = transfer_arb_locs_to_locs(
             locs,
@@ -297,7 +303,22 @@ def process_loc(loc, args, swe_bench_data, prev_o):
                 file_contents[pred_file] = content
                 break
 
-        assert content is not None, f"{pred_file} file not found"
+        if content is None:
+            logger.warning(f"{pred_file} file not found. Skipping this file.")
+            continue  # Skip the file and continue with the next one
+
+    if not file_contents:
+        logger.error("No valid files found for processing.")
+        return {
+            "instance_id": instance_id,
+            "raw_output": [""],
+            "try_count": [0],
+            "all_generations": [[]],
+            "traj": [],
+            "prev_content": [[]],
+            "file_names": [[]],
+        }
+
     # Construct top-n file context
     file_to_edit_locs = dict()
     for i, pred_file in enumerate(pred_files):

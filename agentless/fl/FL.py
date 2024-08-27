@@ -1,5 +1,7 @@
 from abc import ABC, abstractmethod
 
+from openai import OpenAI
+
 from agentless.repair.repair import construct_topn_file_context
 from agentless.util.compress_file import get_skeleton
 from agentless.util.postprocess_data import extract_code_blocks, extract_locs_for_files
@@ -27,29 +29,132 @@ class FL(ABC):
 
 class LLMFL(FL):
     obtain_relevant_files_prompt = """
-Please look through the following GitHub problem description and Repository structure and provide a list of files that one would need to edit to fix the problem.
+    Please look through the following GitHub problem description and Repository structure and provide a list of files that one would need to edit to fix the problem.
 
-### GitHub Problem Description ###
-{problem_statement}
+    ### GitHub Problem Description ###
+    {problem_statement}
 
-###
+    ###
 
-### Repository Structure ###
-{structure}
+    ### Repository Structure ###
+    {structure}
 
-###
+    ###
 
-Please only provide the full path and return at most 5 files.
-The returned files should be separated by new lines ordered by most to least important and wrapped with ```
-For example:
-```
-file1.py
-file2.py
-```
-"""
+    Please return only the full file paths that exists in "Repository Structure", with no additional text or explanation. Return at most 10 files, but at least 3 files.
+    Exclude any files that is not in "Repository Structure". The returned files should be separated by new lines ordered by most to least important and wrapped with ```
+    For example:
+    ```
+    file1.py
+    file2.py
+    ```
+    """
+
+    refine_files_prompt = """
+    ### Initially Identified Files (with functions/classes/variables) ###
+    {initial_files}
+    You previously selected the above "Initially Identified Files" as most relevant to fixing the issue.
+    Now, considering the functions, classes and variables that might need modification in each files based on the GitHub problem description and Repository Structure, please refine the list.
+
+    ### GitHub Problem Description ###
+    {problem_statement}
+
+    ### Repository Structure ###
+    {structure}
+
+    Remove the files that not in "Repository Structure". Please return at least 3 full paths that exist in "Repository Structure", separated by new lines ordered by most to least important, wrapped with ```.
+    For example:
+    ```
+    file1.py
+    file3.py
+    ```
+    """
+
+    def get_detailed_file_info(self, filepath, structure):
+        files, classes, functions = get_full_file_paths_and_classes_and_functions(
+            structure
+        )
+
+        # Find the file in the structure and retrieve detailed info
+        detailed_info = []
+        for file_content in files:
+            if file_content[0] == filepath:
+                detailed_info.append(f"File: {filepath}")
+                for cls in classes:
+                    if cls["file"] == filepath:
+                        detailed_info.append(f"class: {cls['name']}")
+                for func in functions:
+                    if func["file"] == filepath:
+                        detailed_info.append(f"function: {func['name']}")
+                break
+
+        return detailed_info
+
+    def refine_file_selection(self, found_files, structure, problem_statement):
+        # Gather function, class, and variable details for the initially identified files
+        detailed_files = []
+        for filepath in found_files:
+            detailed_info = self.get_detailed_file_info(filepath, structure)
+            if detailed_info:
+                detailed_files.append(f"{filepath}\n{detailed_info}")
+            else:
+                detailed_files.append(filepath)
+
+        detailed_files_str = "\n\n".join(detailed_files)
+        formatted_structure = show_project_structure(structure).strip()
+
+        refine_message = self.refine_files_prompt.format(
+            problem_statement=problem_statement,
+            structure=formatted_structure,
+            initial_files=detailed_files_str,
+        ).strip()
+
+        # Log the refinement prompt
+        self.logger.info(f"Refinement prompt:\n{refine_message}")
+
+        # Use OpenAI's GPT-4o for refinement
+        client = OpenAI()  # Initialize the OpenAI client
+
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o-2024-08-06",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are an expert in code issue localization.",
+                    },
+                    {"role": "user", "content": refine_message},
+                ],
+            )
+            refined_output = response.choices[0].message.content.strip()
+            refined_files = self.extract_file_paths_from_result(refined_output)
+            # Log the refined files
+            self.logger.info(f"Refined files identified:\n{refined_files}")
+            found_files = refined_files
+
+        except Exception as e:
+            # Log the error and return initial files
+            self.logger.error(f"Failed to refine files due to an error: {str(e)}")
+            return found_files  # Return initial files in case of failure
+
+        return found_files
+
+    def extract_file_paths_from_result(self, result):
+        # Extract file paths from the LLM's response
+        lines = result.splitlines()
+        file_paths = []
+        for line in lines:
+            if (
+                line.startswith("```") or not line.strip()
+            ):  # Skip code block markers and empty lines
+                continue
+            path = line.strip("`")
+            if path.endswith(".py"):  # Ensure it is a file path
+                file_paths.append(path)
+        return file_paths
 
     obtain_relevant_code_prompt = """
-Please look through the following GitHub problem description and file and provide a set of locations that one would need to edit to fix the problem.
+Please look through the following GitHub problem description and file paths and provide a set of locations that one would need to edit to fix the problem.
 
 ### GitHub Problem Description ###
 {problem_statement}
@@ -366,6 +471,8 @@ Return just the locations.
         from agentless.util.api_requests import num_tokens_from_messages
         from agentless.util.model import make_model
 
+        # self.logger.info(f"Repository structure:\n{self.structure}")
+        self.logger.info(f"Attempting to retrieve files:\n{file_names}")
         file_contents = get_repo_files(self.structure, file_names)
         compressed_file_contents = {
             fn: get_skeleton(code) for fn, code in file_contents.items()
@@ -459,7 +566,32 @@ Return just the locations.
         from agentless.util.api_requests import num_tokens_from_messages
         from agentless.util.model import make_model
 
-        file_contents = get_repo_files(self.structure, file_names)
+        # Retrieve file contents for the given file names
+        file_contents = {}
+        for file_name in file_names:
+            try:
+                content = get_repo_files(self.structure, [file_name])
+                file_contents.update(content)
+            except AssertionError as e:
+                self.logger.warning(f"Skipping missing file: {file_name} - {str(e)}")
+                continue
+
+        # Handle the case where file contents are not found or missing
+        valid_files = []
+        for pred_file in coarse_locs.keys():
+            if pred_file not in file_contents:
+                self.logger.warning(
+                    f"File not found in retrieved contents: {pred_file}"
+                )
+            else:
+                valid_files.append(pred_file)
+
+        # Proceed only with valid files
+        if not valid_files:
+            self.logger.error("No valid files found for processing.")
+            return [], {"raw_output_loc": ""}, {}
+
+        # Construct the context for valid files
         topn_content, file_loc_intervals = construct_topn_file_context(
             coarse_locs,
             file_names,
@@ -471,16 +603,25 @@ Return just the locations.
             sticky_scroll=sticky_scroll,
             no_line_number=no_line_number,
         )
+        # Choose the appropriate prompt template
         if no_line_number:
             template = self.obtain_relevant_code_combine_top_n_no_line_number_prompt
         else:
             template = self.obtain_relevant_code_combine_top_n_prompt
+
+        # Format the message with the gathered content
         message = template.format(
             problem_statement=self.problem_statement, file_contents=topn_content
         )
         self.logger.info(f"prompting with message:\n{message}")
         self.logger.info("=" * 80)
-        assert num_tokens_from_messages(message, self.model_name) < MAX_CONTEXT_LENGTH
+
+        # Check if the message is within the model's context length
+        if num_tokens_from_messages(message, self.model_name) >= MAX_CONTEXT_LENGTH:
+            self.logger.error("Message exceeds the maximum context length.")
+            return [], {"raw_output_loc": ""}, {}
+
+        # Handle mock mode
         if mock:
             self.logger.info("Skipping querying model since mock=True")
             traj = {

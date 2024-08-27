@@ -89,6 +89,11 @@ def localize_instance(
         found_files, additional_artifact_loc_file, file_traj = fl.localize(
             mock=args.mock
         )
+        # Refine file selection if needed
+        if args.related_level:
+            found_files = fl.refine_file_selection(
+                found_files, structure, problem_statement
+            )
     else:
         # assume start_file is provided
         for locs in start_file_locs:

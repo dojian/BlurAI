@@ -646,13 +646,20 @@ def get_repo_files(structure, filepaths: list[str]):
     for filepath in filepaths:
         content = None
 
+        # Log the attempt to retrieve each file
+        print(f"Attempting to retrieve file: {filepath}")
+
         for file_content in files:
             if file_content[0] == filepath:
                 content = "\n".join(file_content[1])
                 file_contents[filepath] = content
                 break
 
-        assert content is not None, "file not found"
+        if content is None:
+            # Log the error if the file is not found
+            print(f"Error: File not found in structure: {filepath}")
+            continue  # Skip to the next file without raising an error
+
     return file_contents
 
 
